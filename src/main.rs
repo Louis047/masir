@@ -2,6 +2,9 @@ use clap::Parser;
 use color_eyre::Result;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 use windows::core::Result as WindowsCrateResult;
@@ -16,13 +19,23 @@ use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
 use windows::Win32::UI::WindowsAndMessaging::GetWindowLongW;
 use windows::Win32::UI::WindowsAndMessaging::RealGetWindowClassW;
 use windows::Win32::UI::WindowsAndMessaging::SetForegroundWindow;
+use windows::Win32::UI::WindowsAndMessaging::SystemParametersInfoW;
 use windows::Win32::UI::WindowsAndMessaging::WindowFromPoint;
 use windows::Win32::UI::WindowsAndMessaging::GA_ROOT;
 use windows::Win32::UI::WindowsAndMessaging::GET_ANCESTOR_FLAGS;
 use windows::Win32::UI::WindowsAndMessaging::GWL_EXSTYLE;
+use windows::Win32::UI::WindowsAndMessaging::SPIF_SENDCHANGE;
+use windows::Win32::UI::WindowsAndMessaging::SPI_GETACTIVEWINDOWTRACKING;
+use windows::Win32::UI::WindowsAndMessaging::SPI_GETACTIVEWNDTRKTIMEOUT;
+use windows::Win32::UI::WindowsAndMessaging::SPI_GETACTIVEWNDTRKZORDER;
+use windows::Win32::UI::WindowsAndMessaging::SPI_SETACTIVEWINDOWTRACKING;
+use windows::Win32::UI::WindowsAndMessaging::SPI_SETACTIVEWNDTRKTIMEOUT;
+use windows::Win32::UI::WindowsAndMessaging::SPI_SETACTIVEWNDTRKZORDER;
+use windows::Win32::UI::WindowsAndMessaging::SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS;
 use windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE;
 use windows::Win32::UI::WindowsAndMessaging::WS_EX_NOACTIVATE;
 use windows::Win32::UI::WindowsAndMessaging::WS_EX_TOOLWINDOW;
+use windows_core::BOOL;
 use winput::message_loop;
 use winput::message_loop::Event;
 use winput::Action;
@@ -54,6 +67,16 @@ struct Opts {
     /// Path to a file with known focus-able HWNDs (e.g. komorebi.hwnd.json)
     #[clap(long)]
     hwnds: Option<PathBuf>,
+    /// Focus windows without raising them to the top (uses Windows active window tracking)
+    #[clap(long)]
+    no_raise: bool,
+}
+
+/// Stores the original system settings for active window tracking
+struct ActiveTrackingSettings {
+    tracking_enabled: bool,
+    zorder_enabled: bool,
+    timeout_ms: u32,
 }
 
 fn main() -> Result<()> {
@@ -100,7 +123,35 @@ fn main() -> Result<()> {
             .finish(),
     )?;
 
-    listen_for_movements(hwnds.clone());
+    // If --no-raise is enabled, configure Windows' native active window tracking
+    let original_tracking_settings = if opts.no_raise {
+        let settings = get_active_tracking_settings();
+        tracing::info!(
+            "storing original tracking settings: tracking={}, zorder={}, timeout={}ms",
+            settings.tracking_enabled,
+            settings.zorder_enabled,
+            settings.timeout_ms
+        );
+
+        // Enable active window tracking with z-order DISABLED and timeout at 0
+        // This achieves instant focus-on-hover without raising
+        set_active_window_tracking(true);
+        set_active_window_zorder(false);
+        set_active_window_timeout(0); // Instant focus, no delay
+        tracing::info!(
+            "enabled focus-follows-mouse without raise (Windows active tracking, instant)"
+        );
+
+        Some(settings)
+    } else {
+        None
+    };
+
+    // Flag to signal the event loop to exit
+    let running = Arc::new(AtomicBool::new(true));
+    let running_clone = running.clone();
+
+    listen_for_movements(hwnds.clone(), opts.no_raise, running_clone);
 
     match hwnds {
         None => tracing::info!("masir is now running"),
@@ -121,14 +172,44 @@ fn main() -> Result<()> {
         .recv()
         .expect("could not receive signal on ctrl-c channel");
 
+    // Signal event loop to stop
+    running.store(false, Ordering::SeqCst);
+
+    // Restore original tracking settings if we changed them
+    if let Some(settings) = original_tracking_settings {
+        set_active_window_tracking(settings.tracking_enabled);
+        set_active_window_zorder(settings.zorder_enabled);
+        set_active_window_timeout(settings.timeout_ms);
+        tracing::info!(
+            "restored original tracking settings: tracking={}, zorder={}, timeout={}ms",
+            settings.tracking_enabled,
+            settings.zorder_enabled,
+            settings.timeout_ms
+        );
+    }
+
     tracing::info!("received ctrl-c, exiting");
 
     Ok(())
 }
 
-fn listen_for_movements(hwnds: Option<PathBuf>) {
+fn listen_for_movements(hwnds: Option<PathBuf>, no_raise: bool, running: Arc<AtomicBool>) {
     std::thread::spawn(move || {
         let receiver = message_loop::start().expect("could not start winput message loop");
+
+        // When no_raise is enabled, Windows handles focusing via native tracking.
+        // We only need to keep the thread alive so the message loop runs.
+        if no_raise {
+            tracing::info!("no-raise mode: Windows native tracking is handling focus");
+            loop {
+                if !running.load(Ordering::SeqCst) {
+                    break;
+                }
+                // Still need to pump messages for ctrlc to work
+                let _ = receiver.next_event();
+            }
+            return;
+        }
 
         let mut eligibility_cache = HashMap::new();
         let mut class_cache: HashMap<isize, String> = HashMap::new();
@@ -487,4 +568,78 @@ fn real_window_class_w(hwnd: isize) -> Result<String> {
     }))?;
 
     Ok(String::from_utf16(&class[0..len as usize])?)
+}
+
+/// Get current Windows active window tracking settings
+fn get_active_tracking_settings() -> ActiveTrackingSettings {
+    let mut tracking: BOOL = BOOL(0);
+    let mut zorder: BOOL = BOOL(0);
+    let mut timeout: u32 = 0;
+
+    unsafe {
+        let _ = SystemParametersInfoW(
+            SPI_GETACTIVEWINDOWTRACKING,
+            0,
+            Some(&mut tracking as *mut BOOL as *mut std::ffi::c_void),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        );
+        let _ = SystemParametersInfoW(
+            SPI_GETACTIVEWNDTRKZORDER,
+            0,
+            Some(&mut zorder as *mut BOOL as *mut std::ffi::c_void),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        );
+        let _ = SystemParametersInfoW(
+            SPI_GETACTIVEWNDTRKTIMEOUT,
+            0,
+            Some(&mut timeout as *mut u32 as *mut std::ffi::c_void),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        );
+    }
+
+    ActiveTrackingSettings {
+        tracking_enabled: tracking.as_bool(),
+        zorder_enabled: zorder.as_bool(),
+        timeout_ms: timeout,
+    }
+}
+
+/// Enable or disable Windows active window tracking (focus-follows-mouse)
+fn set_active_window_tracking(enabled: bool) {
+    unsafe {
+        let value = if enabled { 1usize } else { 0usize };
+        let _ = SystemParametersInfoW(
+            SPI_SETACTIVEWINDOWTRACKING,
+            0,
+            Some(value as *mut std::ffi::c_void),
+            SPIF_SENDCHANGE,
+        );
+    }
+}
+
+/// Enable or disable z-order change when active window tracking activates a window
+/// When disabled, windows receive focus on hover WITHOUT being raised to top
+fn set_active_window_zorder(enabled: bool) {
+    unsafe {
+        let value = if enabled { 1usize } else { 0usize };
+        let _ = SystemParametersInfoW(
+            SPI_SETACTIVEWNDTRKZORDER,
+            0,
+            Some(value as *mut std::ffi::c_void),
+            SPIF_SENDCHANGE,
+        );
+    }
+}
+
+/// Set the delay (in milliseconds) before a window is activated on hover
+/// Set to 0 for instant activation
+fn set_active_window_timeout(timeout_ms: u32) {
+    unsafe {
+        let _ = SystemParametersInfoW(
+            SPI_SETACTIVEWNDTRKTIMEOUT,
+            0,
+            Some(timeout_ms as usize as *mut std::ffi::c_void),
+            SPIF_SENDCHANGE,
+        );
+    }
 }
